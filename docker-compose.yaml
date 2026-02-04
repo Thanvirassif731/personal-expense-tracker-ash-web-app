@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  # 1. Database Service
+  mongo:
+    image: mongo:latest
+    container_name: expense-tracker-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - app-network
+
+  # 2. Backend Service
+  backend:
+    build: ./backend
+    container_name: expense-tracker-backend
+    ports:
+      - "5000:5000"
+    environment:
+      # Use the service name 'mongo' as the hostname
+      - MONGO_URI=mongodb://mongo:27017/expense-tracker
+      - PORT=5000
+      - JWT_SECRET=supersecuresecretkey
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  # 3. Frontend Service
+  frontend:
+    build: ./frontend
+    container_name: expense-tracker-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+volumes:
+  mongo-data:
+
+networks:
+  app-network:
+    driver: bridge
