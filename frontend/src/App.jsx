@@ -80,14 +80,39 @@ const realApi = {
     };
   },
 
+  // Helper to perform fetch with automatic token refresh
+  fetchWithRefresh: async (url, options = {}) => {
+    const baseOptions = { credentials: 'include', headers: { ...(options.headers || {}) } };
+    const merged = { ...options, ...baseOptions };
+    let res = await fetch(url, merged);
+    if (res.status === 401) {
+      // try refresh
+      const r = await fetch(`${API_BASE_URL}/auth/refresh`, { method: 'POST', credentials: 'include' });
+      if (r.ok) {
+        const body = await r.json();
+        // update stored token
+        const saved = JSON.parse(localStorage.getItem('tracker_user') || 'null');
+        if (saved) {
+          saved.token = body.token;
+          localStorage.setItem('tracker_user', JSON.stringify(saved));
+        }
+        // retry original request with new token
+        merged.headers = { ...(merged.headers || {}), 'Authorization': saved ? saved.token : '' };
+        res = await fetch(url, merged);
+      }
+    }
+    return res;
+  },
+
   fetchExpenses: async () => {
-    const res = await fetch(`${API_BASE_URL}/expenses`, {
+    const res = await realApi.fetchWithRefresh(`${API_BASE_URL}/expenses`, {
+      method: 'GET',
       headers: realApi.getHeaders()
     });
     return await res.json();
   },
   addExpense: async (expense) => {
-    const res = await fetch(`${API_BASE_URL}/expenses`, {
+    const res = await realApi.fetchWithRefresh(`${API_BASE_URL}/expenses`, {
       method: 'POST',
       headers: realApi.getHeaders(),
       body: JSON.stringify(expense)
@@ -95,7 +120,7 @@ const realApi = {
     return await res.json();
   },
   deleteExpense: async (id) => {
-    await fetch(`${API_BASE_URL}/expenses/${id}`, {
+    await realApi.fetchWithRefresh(`${API_BASE_URL}/expenses/${id}`, {
       method: 'DELETE',
       headers: realApi.getHeaders()
     });
@@ -105,7 +130,8 @@ const realApi = {
     const res = await fetch(`${API_BASE_URL}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(credentials)
+      body: JSON.stringify(credentials),
+      credentials: 'include'
     });
     if (!res.ok) {
       const err = await res.json();
@@ -113,11 +139,43 @@ const realApi = {
     }
     return await res.json();
   },
+  logout: async () => {
+    await fetch(`${API_BASE_URL}/auth/logout`, { method: 'POST', credentials: 'include' });
+  },
+  logoutAll: async () => {
+    // requires Authorization header
+    await fetch(`${API_BASE_URL}/auth/logout-all`, { method: 'POST', credentials: 'include', headers: realApi.getHeaders() });
+  },
+  getLogs: async (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    const res = await realApi.fetchWithRefresh(`${API_BASE_URL}/logs?${qs}`, {
+      method: 'GET',
+      headers: realApi.getHeaders()
+    });
+    return await res.json();
+  },
+  getLogsExport: async (params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    const res = await realApi.fetchWithRefresh(`${API_BASE_URL}/logs/export?${qs}`, {
+      method: 'GET',
+      headers: realApi.getHeaders()
+    });
+    return res;
+  },
+  cleanupLogs: async () => {
+    const res = await fetch(`${API_BASE_URL}/logs/cleanup`, { method: 'POST', credentials: 'include', headers: realApi.getHeaders() });
+    return await res.json();
+  },
+  backupLogs: async (body = {}) => {
+    const res = await fetch(`${API_BASE_URL}/logs/backup`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', ...(realApi.getHeaders() || {}) }, body: JSON.stringify(body) });
+    return await res.json();
+  },
   register: async (userData) => {
     const res = await fetch(`${API_BASE_URL}/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(userData)
+      body: JSON.stringify(userData),
+      credentials: 'include'
     });
     if (!res.ok) {
       const err = await res.json();
@@ -157,11 +215,13 @@ const AuthScreen = ({ onLogin }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    const submittedPassword = formData.password;
+    setFormData(prev => ({ ...prev, password: '' }));
     setLoading(true);
     try {
       if (isLogin) {
         // LOGIN FLOW
-        const data = await api.login({ email: formData.email, password: formData.password });
+        const data = await api.login({ email: formData.email, password: submittedPassword });
         // The backend now returns { token, user: {...} }
         // We combine them to store in local storage
         onLogin({ ...data.user, token: data.token });
@@ -170,7 +230,7 @@ const AuthScreen = ({ onLogin }) => {
         await api.register({
           name: formData.name,
           email: formData.email,
-          password: formData.password
+          password: submittedPassword
         });
         alert("Account created! Please sign in.");
         setIsLogin(true); // Switch to login mode
@@ -329,6 +389,105 @@ const ProfileModal = ({ user, onClose, onLogout }) => {
             <LogOut size={18} />
             Sign Out
           </button>
+          <button
+            onClick={() => { onClose(); window.dispatchEvent(new CustomEvent('view-logs')); }}
+            className="w-full mt-2 flex items-center justify-center gap-2 text-slate-700 hover:bg-slate-50 py-3 rounded-lg transition-colors font-medium border border-slate-100"
+          >
+            View Logs
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const LogsModal = ({ open, onClose, loadLogs, logs, loading, page, pages, onPage }) => {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-3xl overflow-auto max-h-[80vh]">
+        <div className="p-4 border-b flex justify-between items-center">
+          <h3 className="font-bold">Activity Logs</h3>
+          <div className="flex items-center gap-2">
+            <button onClick={() => onPage(Math.max(1, page-1))} disabled={page<=1} className="px-3 py-1 border rounded">Prev</button>
+            <span className="text-sm">{page}/{pages}</span>
+            <button onClick={() => onPage(Math.min(pages, page+1))} disabled={page>=pages} className="px-3 py-1 border rounded">Next</button>
+            <button onClick={onClose} className="ml-2 px-3 py-1 border rounded">Close</button>
+          </div>
+        </div>
+        <div className="p-4">
+          <div className="mb-4 grid grid-cols-1 sm:grid-cols-4 gap-2 items-end">
+            <div>
+              <label className="text-xs">Action</label>
+              <input value={logsFilterAction} onChange={e => setLogsFilterAction(e.target.value)} className="w-full border px-2 py-1 rounded" />
+            </div>
+            <div>
+              <label className="text-xs">User ID</label>
+              <input value={logsFilterUserId} onChange={e => setLogsFilterUserId(e.target.value)} className="w-full border px-2 py-1 rounded" />
+            </div>
+            <div>
+              <label className="text-xs">Start Date</label>
+              <input type="date" value={logsFilterStartDate} onChange={e => setLogsFilterStartDate(e.target.value)} className="w-full border px-2 py-1 rounded" />
+            </div>
+            <div>
+              <label className="text-xs">End Date</label>
+              <input type="date" value={logsFilterEndDate} onChange={e => setLogsFilterEndDate(e.target.value)} className="w-full border px-2 py-1 rounded" />
+            </div>
+            <div className="sm:col-span-4 mt-2 flex gap-2">
+              <button onClick={() => loadLogs(1)} className="px-3 py-2 bg-indigo-600 text-white rounded">Apply</button>
+              <button onClick={() => { setLogsFilterAction(''); setLogsFilterUserId(''); setLogsFilterStartDate(''); setLogsFilterEndDate(''); loadLogs(1); }} className="px-3 py-2 border rounded">Reset</button>
+              {user.role === 'Admin' && (
+                <>
+                  <button onClick={async () => {
+                    const params = {};
+                    if (logsFilterAction) params.action = logsFilterAction;
+                    if (logsFilterUserId) params.userId = logsFilterUserId;
+                    if (logsFilterStartDate) params.startDate = logsFilterStartDate;
+                    if (logsFilterEndDate) params.endDate = logsFilterEndDate;
+                    const res = await api.getLogsExport(params);
+                    if (res.ok) {
+                      const blob = await res.blob();
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'logs-export.csv';
+                      document.body.appendChild(a);
+                      a.click();
+                      a.remove();
+                    } else {
+                      const err = await res.json();
+                      alert(err.error || 'Export failed');
+                    }
+                  }} className="px-3 py-2 border rounded">Export CSV</button>
+
+                  <button onClick={async () => {
+                    if (!confirm('Run cleanup of logs older than retention period?')) return;
+                    const resp = await api.cleanupLogs();
+                    alert(`Deleted ${resp.deleted} logs.`);
+                    loadLogs(1);
+                  }} className="px-3 py-2 border rounded">Cleanup</button>
+
+                  <button onClick={async () => {
+                    const resp = await api.backupLogs({ startDate: logsFilterStartDate || undefined, endDate: logsFilterEndDate || undefined });
+                    if (resp.file) {
+                      window.open(resp.file, '_blank');
+                    } else alert('Backup failed');
+                  }} className="px-3 py-2 border rounded">Backup</button>
+                </>
+              )}
+            </div>
+          </div>
+          {loading ? <div>Loading logs...</div> : (
+            <div className="space-y-2">
+              {logs.map(l => (
+                <div key={l._id} className="p-3 border rounded">
+                  <div className="text-xs text-slate-500">{new Date(l.createdAt).toLocaleString()} — {l.userId || 'System'}</div>
+                  <div className="font-medium">{l.action} {l.resource ? `(${l.resource})` : ''}</div>
+                  <pre className="text-xs mt-1 bg-slate-50 p-2 rounded text-slate-700">{JSON.stringify(l.details)}</pre>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -345,6 +504,15 @@ export default function App() {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [filterCategory, setFilterCategory] = useState("All");
   const [timeRange, setTimeRange] = useState("monthly");
+  const [showLogs, setShowLogs] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsPage, setLogsPage] = useState(1);
+  const [logsPages, setLogsPages] = useState(1);
+  const [logsFilterAction, setLogsFilterAction] = useState('');
+  const [logsFilterUserId, setLogsFilterUserId] = useState('');
+  const [logsFilterStartDate, setLogsFilterStartDate] = useState('');
+  const [logsFilterEndDate, setLogsFilterEndDate] = useState('');
 
   // Check for persisted user
   useEffect(() => {
@@ -361,11 +529,21 @@ export default function App() {
     }
   }, [user]);
 
+  useEffect(() => {
+    const handler = () => {
+      setShowLogs(true);
+      loadLogs(1, {});
+    };
+    window.addEventListener('view-logs', handler);
+    return () => window.removeEventListener('view-logs', handler);
+  }, [user]);
+
   const loadData = async () => {
     setLoading(true);
     try {
       const data = await api.fetchExpenses();
-      setExpenses(data);
+      // API returns paginated { items, total, page, pages } or a raw array
+      setExpenses(Array.isArray(data) ? data : (data.items || []));
     } catch (err) {
       console.error("Failed to fetch expenses", err);
     } finally {
@@ -379,9 +557,42 @@ export default function App() {
   };
 
   const handleLogout = () => {
-    setUser(null);
-    localStorage.removeItem('tracker_user');
-    setShowProfile(false);
+    // call API to clear refresh cookie and revoke token server-side
+    (async () => {
+      try {
+        if (!USE_MOCK_API) await realApi.logout();
+      } catch (err) {
+        console.error('Logout error', err);
+      }
+      setUser(null);
+      localStorage.removeItem('tracker_user');
+      setShowProfile(false);
+    })();
+  };
+
+  const loadLogs = async (page = 1, params = {}) => {
+    if (!user) return;
+    setLogsLoading(true);
+    try {
+      const query = {
+        page,
+        limit: 50,
+        action: params.action || logsFilterAction || undefined,
+        userId: params.userId || logsFilterUserId || undefined,
+        startDate: params.startDate || logsFilterStartDate || undefined,
+        endDate: params.endDate || logsFilterEndDate || undefined
+      };
+      // remove undefined
+      Object.keys(query).forEach(k => query[k] === undefined && delete query[k]);
+      const resp = await api.getLogs(query);
+      setLogs(Array.isArray(resp) ? resp : (resp.items || []));
+      setLogsPage(resp.page || page);
+      setLogsPages(resp.pages || 1);
+    } catch (err) {
+      console.error('Failed to load logs', err);
+    } finally {
+      setLogsLoading(false);
+    }
   };
 
   const [formData, setFormData] = useState({
@@ -747,6 +958,19 @@ export default function App() {
             </form>
           </div>
         </div>
+      )}
+      {/* Logs Modal */}
+      {showLogs && (
+        <LogsModal
+          open={showLogs}
+          onClose={() => setShowLogs(false)}
+          loadLogs={loadLogs}
+          logs={logs}
+          loading={logsLoading}
+          page={logsPage}
+          pages={logsPages}
+          onPage={(p) => loadLogs(p)}
+        />
       )}
     </div>
   );
